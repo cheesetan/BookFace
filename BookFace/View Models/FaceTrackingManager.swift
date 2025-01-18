@@ -1,35 +1,26 @@
 //
-//  ContentView.swift
+//  FaceTrackingManager.swift
 //  BookFace
 //
-//  Created by Tristan Chay on 18/1/25.
+//  Created by Tristan Chay on 19/1/25.
 //
 
 import SwiftUI
 import AVFoundation
 import Vision
 
-// Camera view that handles camera preview
-struct CameraPreview: UIViewRepresentable {
-    let session: AVCaptureSession
-
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView(frame: UIScreen.main.bounds)
-        let previewLayer = AVCaptureVideoPreviewLayer(session: session)
-        previewLayer.frame = view.frame
-        previewLayer.videoGravity = .resizeAspectFill
-        view.layer.addSublayer(previewLayer)
-        return view
-    }
-
-    func updateUIView(_ uiView: UIView, context: Context) {}
-}
-
 class FaceTrackingManager: NSObject, ObservableObject {
+    
     @Published var isBlinking = false
+    @Published var blinkCount = 0
+    @Published var capturedImage: UIImage?
+    @Published var isSessionActive = true
+
     let session = AVCaptureSession()
     private let videoDataOutput = AVCaptureVideoDataOutput()
+    private let photoOutput = AVCapturePhotoOutput()
     private var faceLandmarks: VNFaceObservation?
+    private var wasBlinking = false
 
     override init() {
         super.init()
@@ -53,9 +44,11 @@ class FaceTrackingManager: NSObject, ObservableObject {
                 session.addOutput(videoDataOutput)
             }
 
-            DispatchQueue.main.async {
-                self.session.startRunning()
+            if session.canAddOutput(photoOutput) {
+                session.addOutput(photoOutput)
             }
+
+            session.startRunning()
         } catch {
             print("Failed to setup camera: \(error)")
         }
@@ -63,24 +56,37 @@ class FaceTrackingManager: NSObject, ObservableObject {
 
     private func detectFace(in image: CVPixelBuffer) {
         let faceDetectionRequest = VNDetectFaceLandmarksRequest { [weak self] request, error in
-            guard let observations = request.results as? [VNFaceObservation],
+            guard let self = self,
+                  let observations = request.results as? [VNFaceObservation],
                   let face = observations.first else {
                 return
             }
 
             DispatchQueue.main.async {
-                self?.faceLandmarks = face
-                // Check for blinking by analyzing eye landmarks
+                self.faceLandmarks = face
                 if let leftEye = face.landmarks?.leftEye,
                    let rightEye = face.landmarks?.rightEye {
-                    let leftEyeAspectRatio = self?.getEyeAspectRatio(eye: leftEye)
-                    let rightEyeAspectRatio = self?.getEyeAspectRatio(eye: rightEye)
+                    let leftEyeAspectRatio = self.getEyeAspectRatio(eye: leftEye)
+                    let rightEyeAspectRatio = self.getEyeAspectRatio(eye: rightEye)
 
-                    // Threshold for determining if eyes are closed
                     let blinkThreshold: Float = 0.1
-                    let isBlinking = (leftEyeAspectRatio ?? 1.0 < blinkThreshold) &&
-                    (rightEyeAspectRatio ?? 1.0 < blinkThreshold)
-                    self?.isBlinking = isBlinking
+                    let isBlinking = (leftEyeAspectRatio < blinkThreshold) &&
+                    (rightEyeAspectRatio < blinkThreshold)
+
+                    // Count complete blink (only when eyes open after being closed)
+                    if !isBlinking && self.wasBlinking {
+                        self.blinkCount += 1
+
+                        // Take photo after 3 blinks
+                        if self.blinkCount == 5 {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) {
+                                self.takePhoto()
+                            }
+                        }
+                    }
+
+                    self.wasBlinking = isBlinking
+                    self.isBlinking = isBlinking
                 }
             }
         }
@@ -89,10 +95,13 @@ class FaceTrackingManager: NSObject, ObservableObject {
         try? imageRequestHandler.perform([faceDetectionRequest])
     }
 
+    private func takePhoto() {
+        let settings = AVCapturePhotoSettings()
+        photoOutput.capturePhoto(with: settings, delegate: self)
+    }
+
     private func getEyeAspectRatio(eye: VNFaceLandmarkRegion2D) -> Float {
         let points = eye.normalizedPoints
-        // Calculate the eye aspect ratio using the landmark points
-        // EAR = (||p2-p6|| + ||p3-p5||) / (2||p1-p4||)
         guard points.count >= 6 else { return 1.0 }
 
         let p1 = points[0]
@@ -108,6 +117,11 @@ class FaceTrackingManager: NSObject, ObservableObject {
 
         return Float((height1 + height2) / (2.0 * width))
     }
+
+    func stopSession() {
+        session.stopRunning()
+        isSessionActive = false
+    }
 }
 
 extension FaceTrackingManager: AVCaptureVideoDataOutputSampleBufferDelegate {
@@ -119,41 +133,17 @@ extension FaceTrackingManager: AVCaptureVideoDataOutputSampleBufferDelegate {
     }
 }
 
-struct ContentView: View {
-    @StateObject private var faceTrackingManager = FaceTrackingManager()
+extension FaceTrackingManager: AVCapturePhotoCaptureDelegate {
+    func photoOutput(_ output: AVCapturePhotoOutput,
+                     didFinishProcessingPhoto photo: AVCapturePhoto,
+                     error: Error?) {
+        guard let imageData = photo.fileDataRepresentation(),
+              let image = UIImage(data: imageData) else { return }
 
-    @State private var blinkCount = 0
-    let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
-
-    var body: some View {
-        ZStack {
-            CameraPreview(session: faceTrackingManager.session)
-                .edgesIgnoringSafeArea(.all)
-
-            VStack {
-                Spacer()
-                Text("\(blinkCount)")
-                    .font(.title)
-                    .foregroundColor(.white)
-                    .padding()
-                    .background(Color.black.opacity(0.7))
-                    .cornerRadius(10)
-                    .padding(.bottom, 50)
-            }
-        }
-        .onReceive(timer) { time in
-            if blinkCount > 0 {
-                blinkCount -= 1
-            }
-        }
-        .onChange(of: faceTrackingManager.isBlinking) { _, newValue in
-            if newValue {
-                blinkCount += 1
-            }
+        DispatchQueue.main.async {
+            self.capturedImage = image
+            self.stopSession()
         }
     }
 }
 
-#Preview {
-    ContentView()
-}
