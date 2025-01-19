@@ -66,10 +66,13 @@ class AuthManager {
                         "faceVerified" : false
                     ]
                 )
-                signIn(email: email, password: password)
+
+                signIn(email: email, password: password) {
+                    self.addtodb(email: email)
+                }
             } catch {
                 if error.localizedDescription == "User already registered" {
-                    signIn(email: email, password: password)
+                    signIn(email: email, password: password) {}
                 } else {
                     print(error)
                 }
@@ -77,7 +80,23 @@ class AuthManager {
         }
     }
 
-    func signIn(email: String, password: String) {
+    func addtodb(email: String) {
+        Task {
+            do {
+                try await supabase.from("auth").insert(
+                    [
+                        "id": self.currentUser?.id.uuidString ?? "nil",
+                        "email": email,
+                        "chats": ""
+                    ]
+                ).execute()
+            } catch {
+                print(error)
+            }
+        }
+    }
+
+    func signIn(email: String, password: String, _ completion: @escaping () -> ()) {
         Task {
             isLoading = true
             defer { isLoading = false }
@@ -88,6 +107,7 @@ class AuthManager {
                     password: password
                 )
                 updateUserStatus()
+                completion()
             } catch {
                 print(error)
             }
@@ -132,7 +152,7 @@ class AuthManager {
         }
     }
 
-    private func uploadFaceImage(image: UIImage, for type: FaceImageUploadType) {
+    func uploadFaceImage(image: UIImage, for type: FaceImageUploadType) {
         Task {
             isLoading = true
             defer { isLoading = false }
@@ -144,7 +164,7 @@ class AuthManager {
                     try await supabase.storage
                         .from("\(type == .signUp ? "new_user" : "Retrieve")")
                         .upload(
-                            "\(fileName)",
+                            "\(type == .signUp ? "\(fileName)" : "retrieve.jpg")",
                             data: data,
                             options: FileOptions(
                                 cacheControl: "3600",
